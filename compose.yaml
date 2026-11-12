@@ -1,0 +1,10 @@
+services:
+  bot:
+    build: .
+    restart: unless-stopped
+    env_file: .env
+    volumes:
+      - rembg_models:/root/.u2net
+    mem_limit: 3g
+volumes:
+  rembg_models:
