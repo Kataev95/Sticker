@@ -71,14 +71,14 @@ def remove_frames(frames):
             rgba.save(file)
 
 
-async def convert(src, dst):
+async def convert(src, dst, remove_bg):
     info = await probe(src)
     if not any(s.get("codec_type") == "video" for s in info.get("streams", [])):
         raise ValueError("Не найден видеопоток")
     duration = float(info.get("format", {}).get("duration") or 2.95)
     duration = max(0.1, min(duration, 2.95))
     source = src
-    if REMOVE_BG:
+    if remove_bg:
         frames = dst.parent / "frames"
         frames.mkdir()
         await run("ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-i", src,
@@ -93,7 +93,7 @@ async def convert(src, dst):
     for fps, crf in [(24, 36), (24, 42), (20, 46), (16, 49),
                      (12, 53), (10, 57), (8, 60)]:
         args = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y"]
-        if REMOVE_BG:
+        if remove_bg:
             args += ["-stream_loop", "-1", "-framerate", "12"]
         elif duration < 2.9:
             args += ["-stream_loop", "-1"]
@@ -147,8 +147,15 @@ async def cancel(message: Message):
     await message.answer("Операция отменена")
 
 
+def mode_buttons():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="⚡ Быстро — оставить фон", callback_data="mode:fast")],
+        [InlineKeyboardButton(text="✨ Удалить фон — нейросеть", callback_data="mode:remove")]
+    ])
+
+
 @router.message(F.document | F.animation | F.video)
-async def media(message: Message, bot: Bot):
+async def media(message: Message):
     uid = message.from_user.id
     if not allowed(uid):
         return
@@ -162,26 +169,50 @@ async def media(message: Message, bot: Bot):
     if item.file_size and item.file_size > MAX_INPUT:
         await message.answer("Файл слишком большой")
         return
+    if locks.setdefault(uid, asyncio.Lock()).locked():
+        await message.answer("⏳ Дождись предыдущей обработки")
+        return
+    pending[uid] = {"source_file_id": item.file_id, "ext": ext}
+    await message.answer("Выбери режим обработки:", reply_markup=mode_buttons())
+
+
+@router.callback_query(F.data.in_({"mode:fast", "mode:remove"}))
+async def process_mode(callback: CallbackQuery, bot: Bot):
+    uid = callback.from_user.id
+    state = pending.get(uid)
+    if not allowed(uid) or not state or "source_file_id" not in state:
+        await callback.answer("Сначала отправь GIF", show_alert=True)
+        return
     lock = locks.setdefault(uid, asyncio.Lock())
     if lock.locked():
-        await message.answer("⏳ Дождись завершения предыдущей обработки")
+        await callback.answer("Уже обрабатываю", show_alert=True)
         return
+    remove_bg = callback.data == "mode:remove"
+    source_file_id = state["source_file_id"]
+    ext = state["ext"]
+    await callback.answer()
     async with lock:
-        status = await message.answer("⏳ Удаляю фон и конвертирую...")
+        status = await callback.message.answer(
+            "✨ Удаляю фон и конвертирую..." if remove_bg else "⚡ Быстрая конвертация..."
+        )
         try:
             with tempfile.TemporaryDirectory(prefix="sticker_") as directory:
                 src = Path(directory) / ("input" + ext)
                 dst = Path(directory) / "sticker.webm"
-                await bot.download(item, destination=src)
+                await bot.download(source_file_id, destination=src)
                 if src.stat().st_size > MAX_INPUT:
                     raise ValueError("Превышен лимит входного файла")
-                size = await convert(src, dst)
-                await message.answer_document(FSInputFile(dst),
-                                              caption=f"✅ WEBM VP9 · 512×512 · {size // 1024} КБ")
-                uploaded = await telegram_api("uploadStickerFile",
-                    {"user_id": uid, "sticker_format": "video"}, dst)
+                size = await convert(src, dst, remove_bg)
+                await callback.message.answer_document(
+                    FSInputFile(dst),
+                    caption=f"✅ WEBM VP9 · 512×512 · {size // 1024} КБ"
+                )
+                uploaded = await telegram_api(
+                    "uploadStickerFile",
+                    {"user_id": uid, "sticker_format": "video"}, dst
+                )
                 pending[uid] = {"file_id": uploaded["file_id"]}
-                await message.answer("Что дальше?", reply_markup=buttons())
+                await callback.message.answer("Что дальше?", reply_markup=buttons())
             await status.delete()
         except Exception as error:
             logging.exception("Processing failed")
